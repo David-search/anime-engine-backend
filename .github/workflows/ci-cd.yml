@@ -1,0 +1,45 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required repo secrets:
+#   SERVER_SSH_KEY  - private key for root@70.30.158.46:43730 (vast-canada-2)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & save image
+        run: |
+          docker build -t anime-engine-backend:latest .
+          docker save anime-engine-backend:latest | gzip > backend.tar.gz
+
+      - name: Copy image to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: 70.30.158.46
+          port: 43730
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: backend.tar.gz
+          target: /home/anime/backend/
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 70.30.158.46
+          port: 43730
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /home/anime/backend
+            docker load -i backend.tar.gz
+            docker compose up -d --no-build
+            rm -f backend.tar.gz
+            docker image prune -f

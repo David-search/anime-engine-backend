@@ -1,0 +1,8 @@
+.venv
+__pycache__
+*.pyc
+.env
+.cf_profile
+.cf_clearance.json
+verify_phase1.py
+requirements-allanime.txt
