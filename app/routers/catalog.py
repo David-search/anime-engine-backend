@@ -84,6 +84,16 @@ async def search(q: str = "", page: int = 1):
     return await es.filter_search(q=q, sort="POPULARITY_DESC", page=page, size=30)
 
 
+@router.get("/catalog/sitemap")
+async def sitemap():
+    """Lightweight id+title list (all anime) for the frontend sitemap.xml."""
+    db = get_db()
+    if db is None:
+        return {"items": []}
+    cur = db.anime.find({}, {"_id": 1, "title": 1}).sort("popularity", -1)
+    return {"items": [{"id": d["_id"], "title": d.get("title")} async for d in cur]}
+
+
 @router.get("/catalog/anime/{anime_id}")
 async def detail(anime_id: int):
     # Pure DB read — zero AniList in the request path. Enrichment (heavy fields)
