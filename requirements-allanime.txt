@@ -1,3 +1,0 @@
-# Optional: only needed for the allanime provider (Cloudflare browser fallback).
-# Not used in Docker / the megaplay path. Local: pip install -r requirements-allanime.txt && playwright install chromium
-playwright>=1.40

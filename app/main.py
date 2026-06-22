@@ -4,28 +4,36 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import db, es
 from .config import settings
-from .proxy import router as proxy_router
-from .routers import catalog, servers, sources
+from .routers import auth, catalog, search, social
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One shared client for AniList, provider calls, and the streaming proxy.
     app.state.http = httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(20.0, read=60.0),
         headers={"User-Agent": settings.USER_AGENT},
     )
+    # Best-effort: don't block boot if Mongo/ES are unreachable.
+    try:
+        await db.ensure_indexes()
+    except Exception as e:  # noqa: BLE001
+        print(f"[startup] mongo init skipped: {e}")
+    try:
+        await es.ensure_index()
+    except Exception as e:  # noqa: BLE001
+        print(f"[startup] es init skipped: {e}")
     try:
         yield
     finally:
         await app.state.http.aclose()
-        from .cf import manager
-        await manager.close()
+        await db.close()
+        await es.close()
 
 
-app = FastAPI(title="Anime Clone API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="AniChan API", version="0.3.0", lifespan=lifespan)
 
 _origins = ["*"] if settings.CORS_ORIGINS.strip() == "*" else [
     o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()
@@ -40,16 +48,20 @@ app.add_middleware(
 )
 
 app.include_router(catalog.router, prefix="/api")
-app.include_router(sources.router, prefix="/api")
-app.include_router(servers.router, prefix="/api")
-app.include_router(proxy_router, prefix="/api")
+app.include_router(search.router, prefix="/api")
+app.include_router(auth.router, prefix="/api")
+app.include_router(social.router, prefix="/api")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "mongo": bool(settings.MONGO_URI),
+        "elastic": bool(settings.ELASTIC_URL),
+    }
 
 
 @app.get("/")
 async def root():
-    return {"name": "anime-clone-api", "version": "0.1.0", "docs": "/docs"}
+    return {"name": "anichan-api", "version": "0.3.0", "docs": "/docs"}

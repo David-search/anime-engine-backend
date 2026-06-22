@@ -7,13 +7,15 @@ services:
       - "${BACKEND_HOST_PORT:-8000}:8000"
     environment:
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
-      - TEST_STREAM=${TEST_STREAM:-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8}
-      # Wired when social/search are integrated (containers on goongle-network):
+      # Data stores (in-network container names on goongle-network):
       - MONGO_URI=${MONGO_URI:-}
       - ELASTIC_URL=${ELASTIC_URL:-}
       - ELASTIC_USER=${ELASTIC_USER:-}
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-}
       - ELASTIC_INDEX=${ELASTIC_INDEX:-anime}
+      # Auth (JWT signing + Google sign-in verification):
+      - JWT_SECRET=${JWT_SECRET:-}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
     restart: unless-stopped
     networks:
       - goongle-network
