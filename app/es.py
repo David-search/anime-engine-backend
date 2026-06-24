@@ -64,7 +64,7 @@ def get_es() -> AsyncElasticsearch | None:
 def _doc(a: dict) -> dict:
     syn = " ".join(a.get("synonyms") or [])
     suggest = " ".join(filter(None, [a.get("title"), a.get("titleRomaji"), a.get("titleNative"), syn]))
-    return {
+    out = {
         "anilist": a["id"], "idMal": a.get("idMal"),
         "title": a.get("title"), "titleRomaji": a.get("titleRomaji"),
         "titleNative": a.get("titleNative"),
@@ -78,6 +78,13 @@ def _doc(a: dict) -> dict:
         "favourites": a.get("favourites") or 0,
         "popularity": a.get("popularity") or 0, "poster": a.get("poster"),
     }
+    # Preserve availability flags across re-indexes. index_anime REPLACES the whole
+    # ES doc, so a refresh/sweep would otherwise wipe the SUB/DUB/playable badges
+    # that `ingest availability` stamped. _save backfills these from Mongo first.
+    for k in ("playable", "hasSub", "hasDub", "sourceCount", "availEps"):
+        if a.get(k) is not None:
+            out[k] = a[k]
+    return out
 
 
 async def ensure_index() -> None:

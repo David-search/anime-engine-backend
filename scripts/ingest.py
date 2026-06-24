@@ -35,6 +35,9 @@ MAX_POP_PAGES = 100  # 100 * 50 = 5000 = AniList's hard offset cap
 FIRST_YEAR = 1940
 
 
+_AVAIL_FIELDS = ("playable", "hasSub", "hasDub", "sourceCount", "availEps")
+
+
 async def _save(db, items: list[dict]) -> int:
     items = [a for a in items if a]
     if not items:
@@ -45,6 +48,21 @@ async def _save(db, items: list[dict]) -> int:
              for a in items],
             ordered=False,
         )
+        # Backfill availability from Mongo so the ES re-index keeps the SUB/DUB/
+        # playable badges (AniList items don't carry them; index_anime replaces the
+        # whole ES doc, so without this a refresh/sweep wipes the badges).
+        ids = [a["id"] for a in items]
+        existing = {
+            d["_id"]: d
+            async for d in db.anime.find(
+                {"_id": {"$in": ids}}, {k: 1 for k in _AVAIL_FIELDS}
+            )
+        }
+        for a in items:
+            ex = existing.get(a["id"]) or {}
+            for k in _AVAIL_FIELDS:
+                if k in ex:
+                    a[k] = ex[k]
     await es.index_anime(items)
     return len(items)
 
