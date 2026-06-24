@@ -22,5 +22,11 @@ class Settings:
     JWT_TTL_DAYS = int(os.getenv("JWT_TTL_DAYS", "30"))
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
+    # Telegram log shipping (optional; mirrors goongle). No-op when unset.
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_TOPIC_ID = os.getenv("TELEGRAM_TOPIC_ID", "")
+    SERVER_ID = os.getenv("SERVER_ID", "anime")
+
 
 settings = Settings()

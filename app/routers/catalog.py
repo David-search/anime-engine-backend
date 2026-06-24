@@ -5,6 +5,7 @@ The ONE exception is `trending`, which mirrors AniList's live TRENDING_DESC rank
 (time-sensitive — not something we snapshot), cached in-process so it costs ~1
 AniList call per TTL window, not per request.
 """
+import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request
@@ -13,6 +14,7 @@ from .. import anilist, es
 from ..db import get_db
 
 router = APIRouter()
+logger = logging.getLogger("anichan.catalog")
 
 # Live AniList trending, cached. (ES `popularity` is all-time, so serving it as
 # "trending" wrongly pins evergreen giants like One Piece at #1.)
@@ -67,21 +69,27 @@ async def genres():
 @router.get("/catalog/browse")
 async def browse(q: str = "", genre: str = "", tag: str = "", fmt: str = "",
                  status: str = "", season: str = "", source: str = "", year: int = 0,
-                 sort: str = "POPULARITY_DESC", page: int = 1):
+                 sort: str = "POPULARITY_DESC", available: int = 1, page: int = 1):
+    # available=1 (default) hides only KNOWN-unplayable titles; pass available=0 to show all.
+    if q.strip() and page == 1:
+        logger.info("🔎 search · %r", q.strip())
     return await es.filter_search(
         q=q,
         genres=[g for g in genre.split(",") if g],
         tags=[t for t in tag.split(",") if t],
         fmt=fmt or None, status=status or None, season=season or None,
-        source=source or None, year=year or None, sort=sort, page=page, size=30,
+        source=source or None, year=year or None, sort=sort,
+        available=bool(available), page=page, size=30,
     )
 
 
 @router.get("/catalog/search")
-async def search(q: str = "", page: int = 1):
+async def search(q: str = "", available: int = 1, page: int = 1):
     if not q.strip():
         return {"results": [], "total": 0, "hasNext": False}
-    return await es.filter_search(q=q, sort="POPULARITY_DESC", page=page, size=30)
+    if page == 1:
+        logger.info("🔎 search · %r", q.strip())
+    return await es.filter_search(q=q, sort="POPULARITY_DESC", available=bool(available), page=page, size=30)
 
 
 @router.get("/catalog/sitemap")

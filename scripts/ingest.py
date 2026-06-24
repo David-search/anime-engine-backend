@@ -21,11 +21,12 @@ idempotent/resumable. AniList caps offset pagination at 5000 entries and runs
 import asyncio
 import datetime
 import sys
+import time
 
 import httpx
 from pymongo import UpdateOne
 
-from app import anilist, es
+from app import anilist, es, sources
 from app.db import ensure_indexes, get_db
 
 PER_PAGE = 50
@@ -157,6 +158,87 @@ async def parse_full(client, db, ids: list[int]) -> int:
     return n
 
 
+async def stamp_availability(client, db, limit: int | None = None,
+                             only_missing: bool = False, concurrency: int = 2,
+                             delay: float = 0.5) -> int:
+    """Per-anime availability via the Miruro pipe: stamp playable/hasSub/hasDub/
+    sourceCount/availEps into Mongo + ES. One cheap pipe call each. Popularity-first
+    so marquee titles get badged before the long tail. Idempotent; re-runnable."""
+    if db is None:
+        print("no mongo; nothing to stamp", flush=True)
+        return 0
+    q = {"availAt": {"$exists": False}} if only_missing else {}
+    cur = db.anime.find(q, {"_id": 1}).sort("popularity", -1)
+    if limit:
+        cur = cur.limit(limit)
+    ids = [d["_id"] async for d in cur]
+    print(f"[avail] {len(ids)} anime to check (concurrency={concurrency})", flush=True)
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+
+    async def _one(aid: int):
+        nonlocal done
+        async with sem:
+            try:
+                data = await sources.list_sources(client, aid)
+            except Exception:  # noqa: BLE001
+                data = None
+            if data is not None:
+                srcs = data.get("sources", [])
+                eps = data.get("episodes", 0)
+                fields = {
+                    # Playable if Miruro knows any episode for it — NOT only when one of
+                    # our 5 curated hosts has it. A RELEASING show with aired episodes is
+                    # watchable even if the curated set lags; only genuinely source-less
+                    # titles (eps == 0, e.g. NOT_YET_RELEASED) fall to "Coming soon".
+                    "playable": eps > 0 or len(srcs) > 0,
+                    "hasSub": any(s.get("sub") for s in srcs),
+                    "hasDub": any(s.get("dub") for s in srcs),
+                    "sourceCount": len(srcs),
+                    "availEps": eps,
+                    "availAt": int(time.time()),
+                }
+                await db.anime.update_one({"_id": aid}, {"$set": fields})
+                await es.update_fields(aid, fields)
+            done += 1
+            if done % 100 == 0:
+                print(f"[avail] {done}/{len(ids)}", flush=True)
+                sources._ep_cache.clear()  # keep the in-process episode cache bounded
+            await asyncio.sleep(delay)  # gentle: never rate-limit our own live streaming
+
+    await asyncio.gather(*[_one(a) for a in ids])
+    print(f"[avail] done: {done} checked", flush=True)
+    return done
+
+
+async def refresh_volatile(client, db) -> int:
+    """Keep the catalog fresh (answers 'how do airing dates stay current + how do
+    we get new anime'): re-pull AniList's MOVING slice — every RELEASING show
+    (updates nextAiring/episodes/status), upcoming announcements, and the current/
+    next year (new titles). Small + fast; run daily as a cron. The 17k base
+    catalog is otherwise static."""
+    total = 0
+    now = datetime.datetime.utcnow().year
+    for status in ("RELEASING", "NOT_YET_RELEASED"):
+        page = 1
+        while page <= 40:
+            items = await _retry(
+                lambda p=page, s=status: anilist.browse(client, status=s, sort=["START_DATE_DESC"], page=p, per=PER_PAGE),
+                f"[refresh {status}] p{page}",
+            )
+            if not items:
+                break
+            total += await _save(db, items)
+            print(f"[refresh {status}] p{page} +{len(items)} total={total}", flush=True)
+            await asyncio.sleep(SLEEP)
+            if len(items) < PER_PAGE:
+                break
+            page += 1
+    total += await sweep_years(client, db, now, now + 1)  # new/updated recent titles
+    print(f"[refresh] done: {total} upserts", flush=True)
+    return total
+
+
 async def run(mode: str = "full", *args) -> int:
     db = get_db()
     await ensure_indexes()
@@ -179,6 +261,12 @@ async def run(mode: str = "full", *args) -> int:
                 n = int(args[0]) if args else 5
                 items, _ = await anilist.crawl_popular(client, 1, max(n, 5))
                 grand += await parse_full(client, db, [a["id"] for a in items][:n])
+            if mode == "availability":
+                only_missing = bool(args) and args[0] == "missing"
+                limit = None if only_missing else (int(args[0]) if args else None)
+                grand += await stamp_availability(client, db, limit, only_missing)
+            if mode == "refresh":
+                grand += await refresh_volatile(client, db)
     finally:
         await es.close()
     print(f"DONE ({mode}): {grand} upserts (re-counts overlaps; unique = db count)", flush=True)

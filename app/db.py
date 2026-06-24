@@ -29,6 +29,13 @@ async def ensure_indexes() -> None:
     await db.comments.create_index([("anime_id", 1), ("created", -1)])
     await db.likes.create_index([("anime_id", 1), ("user_id", 1)], unique=True)
     await db.history.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
+    # watchlist ("My List") — one entry per (user, anime)
+    await db.watchlist.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
+    await db.watchlist.create_index([("user_id", 1), ("added", -1)])
+    # user-built lists: public "tops" (ranked, rateable) + private "collections"
+    await db.lists.create_index([("user_id", 1), ("updated", -1)])
+    await db.lists.create_index([("kind", 1), ("public", 1), ("ratingAvg", -1)])
+    await db.list_ratings.create_index([("list_id", 1), ("user_id", 1)], unique=True)
 
 
 async def close() -> None:

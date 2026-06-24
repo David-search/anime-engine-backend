@@ -16,6 +16,11 @@ services:
       # Auth (JWT signing + Google sign-in verification):
       - JWT_SECRET=${JWT_SECRET:-}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      # Telegram log shipping (optional):
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_TOPIC_ID=${TELEGRAM_TOPIC_ID:-}
+      - SERVER_ID=${SERVER_ID:-anime}
     restart: unless-stopped
     networks:
       - goongle-network

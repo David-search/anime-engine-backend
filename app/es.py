@@ -39,6 +39,13 @@ MAPPING = {
             "episodes": {"type": "integer"},
             "popularity": {"type": "long"},
             "poster": {"type": "keyword", "index": False},
+            # availability — stamped by `ingest availability` from the Miruro pipe.
+            # Absent = not yet checked (kept in results); False = known no-source.
+            "playable": {"type": "boolean"},
+            "hasSub": {"type": "boolean"},
+            "hasDub": {"type": "boolean"},
+            "sourceCount": {"type": "integer"},
+            "availEps": {"type": "integer"},
         }
     }
 }
@@ -79,6 +86,24 @@ async def ensure_index() -> None:
         return
     if not await es.indices.exists(index=INDEX):
         await es.indices.create(index=INDEX, body=MAPPING)
+    else:
+        # additive: ensure availability fields exist on an already-created index
+        try:
+            await es.indices.put_mapping(index=INDEX, body={"properties": MAPPING["mappings"]["properties"]})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def update_fields(anilist_id: int, fields: dict) -> bool:
+    """Partial ES update (e.g. availability flags) — no full re-index."""
+    es = get_es()
+    if es is None:
+        return False
+    try:
+        await es.update(index=INDEX, id=anilist_id, doc=fields)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def index_anime(items: list[dict]) -> int:
@@ -95,9 +120,12 @@ def _hit_to_card(src: dict) -> dict:
         "id": src.get("anilist"), "idMal": src.get("idMal"),
         "title": src.get("title"), "titleRomaji": src.get("titleRomaji"),
         "titleNative": src.get("titleNative"), "poster": src.get("poster"),
-        "format": src.get("format"), "startDate": src.get("startDate"),
+        "format": src.get("format"), "status": src.get("status"),
+        "startDate": src.get("startDate"),
         "score": src.get("score"), "episodes": src.get("episodes"),
         "genres": src.get("genres", []),
+        "hasSub": src.get("hasSub"), "hasDub": src.get("hasDub"),
+        "playable": src.get("playable"), "availEps": src.get("availEps"),
     }
 
 
@@ -145,13 +173,18 @@ _SORTS = {
 
 async def filter_search(*, q: str = "", genres=None, tags=None, fmt=None, status=None,
                         season=None, source=None, year=None, sort="POPULARITY_DESC",
-                        page: int = 1, size: int = 30) -> dict:
-    """AniList-style faceted browse over ES. Genres/tags are AND-ed. Paginated."""
+                        available: bool = True, page: int = 1, size: int = 30) -> dict:
+    """AniList-style faceted browse over ES. Genres/tags are AND-ed. Paginated.
+
+    `available=True` hides only KNOWN-unplayable titles (`playable:false`); titles
+    not yet checked (no `playable` field) stay visible, so it's safe pre-ingest.
+    """
     es = get_es()
     if es is None:
         return {"results": [], "total": 0, "hasNext": False}
     must = []
     filt = []
+    must_not = [{"term": {"playable": False}}] if available else []
     if (q or "").strip():
         must.append({"multi_match": {
             "query": q, "type": "best_fields", "fuzziness": "AUTO",
@@ -178,7 +211,7 @@ async def filter_search(*, q: str = "", genres=None, tags=None, fmt=None, status
     frm = (max(page, 1) - 1) * size
     r = await es.search(index=INDEX, body={
         "from": frm, "size": size,
-        "query": {"bool": {"must": must or [{"match_all": {}}], "filter": filt}},
+        "query": {"bool": {"must": must or [{"match_all": {}}], "filter": filt, "must_not": must_not}},
         "sort": sort_clause, "track_total_hits": True,
     })
     hits = r["hits"]["hits"]

@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 import httpx
@@ -6,7 +7,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import db, es
 from .config import settings
-from .routers import auth, catalog, search, social
+from .routers import auth, catalog, search, social, watch
+from .telegram_logger import setup_telegram_logging
+
+# Logs (incl. WARNING/ERROR) ship to a Telegram channel when configured (mirrors goongle).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s · %(name)s · %(levelname)s · %(message)s")
+for _noisy in ("httpx", "httpcore", "uvicorn.access", "elastic_transport"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+logger = logging.getLogger("anichan")
+_tg = setup_telegram_logging(level=logging.INFO)
+if _tg:
+    logging.getLogger().addHandler(_tg)
 
 
 @asynccontextmanager
@@ -20,11 +31,12 @@ async def lifespan(app: FastAPI):
     try:
         await db.ensure_indexes()
     except Exception as e:  # noqa: BLE001
-        print(f"[startup] mongo init skipped: {e}")
+        logger.warning("mongo init skipped: %s", e)
     try:
         await es.ensure_index()
     except Exception as e:  # noqa: BLE001
-        print(f"[startup] es init skipped: {e}")
+        logger.warning("es init skipped: %s", e)
+    logger.info("AniChan backend %s started", app.version)
     try:
         yield
     finally:
@@ -51,6 +63,7 @@ app.include_router(catalog.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(social.router, prefix="/api")
+app.include_router(watch.router, prefix="/api")
 
 
 @app.get("/health")
