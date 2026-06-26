@@ -9,6 +9,7 @@ version-controlled and never lost (they previously lived only on the ephemeral n
 |--------|------|
 | `ingest.py` | orchestrator: map (ani.zip→AniDB) → find release (AnimeTosho) → download (transmission) → build → register → push cache-state. CLI: `episode <anilist_id> <ep>`, `stats`, `evict <gb>`, `reindex`. |
 | `hls_build.py` | the encoder: source → multi-quality HLS ladder (NVENC CQ / libx264 fallback) + all audio (AAC) + all subs (VTT/ASS) + fonts. `--remux-native`, `--no-nvenc`, `--cq`, `--renditions`. |
+| `batch_farm.py` | pipelined build-farm harness: parallel download (transmission queue) → per-GPU-pinned NVENC workers + CPU/libx264 workers → Y encode → **ship-and-delete** to host → measures eps/hr, download Mbps, peak disk, GPU-vs-CPU split. Env: `N`, `NGPU`, `GPU_WORKERS_PER`, `CPU_WORKERS`, `SHIP_DEST`. |
 | `cache_db.py` | SQLite cache index (`/data/cache/index.db`) + LRU eviction + mapping cache. |
 | `relparser.py` | release-title parser (season/episode/part extraction). |
 | `at_acquire.py` | AnimeTosho acquire helper. |
