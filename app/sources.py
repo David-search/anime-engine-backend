@@ -163,13 +163,23 @@ async def list_sources(http: httpx.AsyncClient, anilist_id: int) -> dict:
         return {"episodes": 0, "sources": []}
     idx = _index_providers(data)
     by_host: dict[str, dict] = {}
-    maxep = 0
+    # availEps = number of AVAILABLE episodes. Use each provider's episode COUNT, not
+    # the max episode NUMBER — a provider can emit concatenated/bogus numbers (animegg
+    # returns 166167/147148/2526 for double-episodes), which max(number) inherits. Then
+    # take the cross-provider CONSENSUS and reject wild outliers (a provider that
+    # fuzzy-matched a DIFFERENT, longer anime — e.g. allmanga returning a 30-ep range
+    # for a 1-ep movie) by dropping counts far above the median.
+    counts = []
     for info in idx.values():
         by_host.setdefault(info["host"], info)
-        for m in info["cats"].values():
-            nums = [n for n in m if isinstance(n, int)]
-            if nums:
-                maxep = max(maxep, max(nums))
+        c = max((len(m) for m in info["cats"].values()), default=0)
+        if c:
+            counts.append(c)
+    maxep = 0
+    if counts:
+        counts.sort()
+        med = counts[(len(counts) - 1) // 2]          # lower median = robust consensus
+        maxep = max((c for c in counts if c <= med * 3), default=med)
     sources = []
     for i, (host, _mode) in enumerate(RELIABLE_SOURCES, 1):
         info = by_host.get(host)
