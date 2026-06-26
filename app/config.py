@@ -22,6 +22,16 @@ class Settings:
     JWT_TTL_DAYS = int(os.getenv("JWT_TTL_DAYS", "30"))
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
+    # Self-hosted video origin (the AniChan video tier). When SELFHOST_CACHE=1 and
+    # an episode is cached at SELFHOST_ORIGIN/{anilistId}/{ep}/{cat}/master.m3u8, it
+    # is offered as Source 1 (ad-free), proxied like any other HLS source.
+    SELFHOST_CACHE = os.getenv("SELFHOST_CACHE", "0") == "1"
+    SELFHOST_ORIGIN = os.getenv("SELFHOST_ORIGIN", "").rstrip("/")
+    # Video-node ingest trigger: when a user opens an anime page, fire-and-forget
+    # a request here to cache the episode (+ prefetch). Empty = disabled.
+    SELFHOST_INGEST_URL = os.getenv("SELFHOST_INGEST_URL", "").rstrip("/")
+    SELFHOST_INGEST_TOKEN = os.getenv("SELFHOST_INGEST_TOKEN", "")  # shared secret for the trigger
+
     # Telegram log shipping (optional; mirrors goongle). No-op when unset.
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

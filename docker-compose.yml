@@ -21,6 +21,11 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_TOPIC_ID=${TELEGRAM_TOPIC_ID:-}
       - SERVER_ID=${SERVER_ID:-anime}
+      # Self-hosted video origin (offer the ad-free cache as Source 1 when present):
+      - SELFHOST_CACHE=${SELFHOST_CACHE:-0}
+      - SELFHOST_ORIGIN=${SELFHOST_ORIGIN:-}
+      - SELFHOST_INGEST_URL=${SELFHOST_INGEST_URL:-}
+      - SELFHOST_INGEST_TOKEN=${SELFHOST_INGEST_TOKEN:-}
     restart: unless-stopped
     networks:
       - goongle-network

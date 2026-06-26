@@ -9,13 +9,16 @@ host CDN requires (browsers can't set Referer, and the CDNs send no CORS).
     GET /api/watch/seg?url=&ref=               -> segment/key bytes (Range-aware)
     GET /api/watch/vtt?url=&ref=               -> subtitle track (text/vtt)
 """
+import asyncio
 import ipaddress
 import logging
 import re
+import socket
+import time
 import urllib.parse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from .. import sources
@@ -24,6 +27,16 @@ from ..db import get_db
 
 router = APIRouter(prefix="/watch", tags=["watch"])
 logger = logging.getLogger("anichan.watch")
+
+_bg_tasks: set = set()
+
+
+def _bg(coro) -> None:
+    """Fire-and-forget a coroutine, keeping a strong ref so the event loop can't
+    garbage-collect the task before it completes."""
+    t = asyncio.ensure_future(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
 
 
 async def _title(anilist_id: int) -> str:
@@ -42,20 +55,39 @@ def _proxy(kind: str, url: str, ref: str) -> str:
     return f"/api/watch/{kind}?" + urllib.parse.urlencode({"url": url, "ref": ref})
 
 
+_safe_cache: dict[str, float] = {}   # host -> expiry of a passed check
+_SAFE_TTL = 300
+
+
 def _safe(url: str) -> None:
-    """Minimal SSRF guard: https/http only, no localhost / private ranges."""
+    """SSRF guard: http(s) only; RESOLVE the host and reject if any resolved
+    address is private/loopback/link-local/reserved/unspecified/multicast. This
+    blocks octal/decimal/hex IP-literal encodings and hostnames that point at
+    internal or cloud-metadata IPs (169.254.169.254). Results cached per host."""
     p = urllib.parse.urlsplit(url)
     if p.scheme not in ("http", "https") or not p.hostname:
         raise HTTPException(400, "bad url")
     host = p.hostname.lower()
-    if host in ("localhost",) or host.endswith(".local"):
+    if _safe_cache.get(host, 0.0) > time.time():
+        return
+    if host == "localhost" or host.endswith((".local", ".internal")):
         raise HTTPException(400, "blocked host")
     try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        infos = socket.getaddrinfo(host, p.port or (443 if p.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise HTTPException(400, "unresolvable host")
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
             raise HTTPException(400, "blocked host")
-    except ValueError:
-        pass  # hostname, not a literal IP — fine
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+            raise HTTPException(400, "blocked host")
+    if len(_safe_cache) > 4096:
+        _safe_cache.clear()
+    _safe_cache[host] = time.time() + _SAFE_TTL
 
 
 def _abs(base: str, u: str) -> str:
@@ -86,6 +118,8 @@ async def servers(request: Request, anilistId: int, ep: int = 1, category: str =
     """Curated source list for one episode (reliable hosts, clean first then
     embeds). hls/mp4 play via our proxy; embed is a sandboxed iframe URL."""
     logger.info("▶ watch · %s · ep %s · %s", await _title(anilistId), ep, category)
+    # opening/playing an episode → tell the video node to cache it (+ prefetch).
+    _bg(sources.trigger_ingest(request.app.state.http, anilistId, ep))
     items = await sources.resolve_all(request.app.state.http, anilistId, ep, category)
     out = []
     for i, s in enumerate(items, 1):
@@ -95,14 +129,53 @@ async def servers(request: Request, anilistId: int, ep: int = 1, category: str =
             entry["embed"] = s["url"]
         else:
             entry["stream"] = _proxy("m3u8" if s["type"] == "hls" else "seg", s["url"], ref)
-            entry["subtitles"] = [
-                {"lang": x.get("label") or x.get("language") or "Subtitle",
-                 "url": _proxy("vtt", x["file"], ref), "default": bool(x.get("default"))}
-                for x in (s.get("subtitles") or []) if x.get("file")
-            ]
+            subs_out = []
+            for x in (s.get("subtitles") or []):
+                if not x.get("file") and not x.get("ass"):
+                    continue
+                so = {"lang": x.get("label") or x.get("language") or "Subtitle",
+                      "default": bool(x.get("default"))}
+                if x.get("file"):
+                    so["url"] = _proxy("vtt", x["file"], ref)        # WebVTT (fallback)
+                if x.get("ass"):
+                    so["ass"] = _proxy("seg", x["ass"], ref)         # styled ASS (JASSUB)
+                subs_out.append(so)
+            entry["subtitles"] = subs_out
+            if s.get("fonts"):  # embedded fonts for faithful ASS rendering
+                entry["fonts"] = [_proxy("seg", f, ref) for f in s["fonts"]]
+            if s.get("audios"):  # multi-audio (JP + dubs); player builds an audio selector
+                entry["audios"] = s["audios"]
+            if s.get("default_audio"):  # DUB toggle -> default to a non-JP track
+                entry["defaultAudio"] = s["default_audio"]
             entry["intro"] = s.get("intro")
         out.append(entry)
     return {"servers": out}
+
+
+@router.post("/cache-state")
+async def cache_state(request: Request, x_ingest_token: str = Header(default="")):
+    """Video node → backend: which episodes of an anime are now cached + their
+    ani.zip episode titles. Token-auth'd (shared SELFHOST_INGEST_TOKEN). Upserts the
+    `selfhost_cache` collection the catalog reads for coverage badges + episode
+    titles — the node's cache_db stays the source of truth; this is a read-index."""
+    if not settings.SELFHOST_INGEST_TOKEN or x_ingest_token != settings.SELFHOST_INGEST_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    body = await request.json()
+    try:
+        aid = int(body["anilist_id"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "bad anilist_id")
+    db = get_db()
+    if db is None:
+        raise HTTPException(503, "no db")
+    await db.selfhost_cache.update_one(
+        {"_id": aid},
+        {"$set": {"cached": body.get("cached") or {}, "ep_titles": body.get("ep_titles") or {},
+                  "total_eps": body.get("total_eps"), "updated_at": int(time.time())}},
+        upsert=True)
+    logger.info("◆ cache-state · %s · sub=%s dub=%s", aid,
+                (body.get("cached") or {}).get("sub"), (body.get("cached") or {}).get("dub"))
+    return {"ok": True, "anilist_id": aid}
 
 
 @router.get("/sources")
@@ -149,9 +222,23 @@ async def m3u8(request: Request, url: str, ref: str = ""):
             out.append(line)
             continue
         if s.startswith("#"):
-            m = _KEY_URI.search(s)  # EXT-X-KEY / EXT-X-MAP carry a URI to proxy
+            # Subtitles are delivered via the `subtitles` array (player <track>s), not
+            # in-manifest — drop the EXT-X-MEDIA subtitle group + its STREAM-INF ref so
+            # hls.js doesn't add extra textTracks that desync the subtitle selector.
+            if s.startswith("#EXT-X-MEDIA") and "TYPE=SUBTITLES" in s:
+                continue
+            if s.startswith("#EXT-X-STREAM-INF"):
+                # drop the removed subtitle group ref whether it's the first attr
+                # (':SUBTITLES=…,') or a later one (',SUBTITLES=…') — no dangling comma
+                s = re.sub(r'(:)SUBTITLES="[^"]*",?', r"\1", s)
+                s = re.sub(r',SUBTITLES="[^"]*"', "", s)
+            m = _KEY_URI.search(s)
             if m:
-                s = s.replace(m.group(1), _proxy("seg", _abs(base, m.group(1)), ref))
+                # a URI targeting a PLAYLIST (.m3u8 — audio group / I-FRAME variant)
+                # is proxied as m3u8; KEY/MAP byte URIs as seg.
+                uri = m.group(1)
+                kind = "m3u8" if (".m3u8" in uri.lower() or s.startswith("#EXT-X-MEDIA")) else "seg"
+                s = s.replace(uri, _proxy(kind, _abs(base, uri), ref))
             out.append(s)
             continue
         kind = "m3u8" if ".m3u8" in s.lower() else "seg"

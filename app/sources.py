@@ -17,10 +17,13 @@ import asyncio
 import base64
 import gzip
 import json
+import re
 import time
 from typing import Any, Optional
 
 import httpx
+
+from .config import settings
 
 # Base domains rotate; iterate in order (.online is dead from our IP, .bz works).
 MIRURO_BASES = [
@@ -236,11 +239,149 @@ def _epref(s: dict) -> int:
     return 1
 
 
-async def resolve_all(http: httpx.AsyncClient, anilist_id: int, ep: int, category: str) -> list[dict]:
-    """Resolve the curated sources for one episode: one entry per RELIABLE_SOURCES
-    host, using its clean stream (hls/mp4) or its embed, per the host's mode.
-    Returned in display order — clean first, embeds last. Cached briefly.
-    """
+_LANG_NAMES = {
+    "eng": "English", "jpn": "Japanese", "por": "Portuguese", "spa": "Spanish",
+    "ara": "Arabic", "fre": "French", "fra": "French", "ger": "German", "deu": "German",
+    "ita": "Italian", "rus": "Russian", "pol": "Polish", "dut": "Dutch", "nld": "Dutch",
+    "tur": "Turkish", "kor": "Korean", "chi": "Chinese", "zho": "Chinese", "vie": "Vietnamese",
+    "ind": "Indonesian", "tha": "Thai", "heb": "Hebrew", "ron": "Romanian", "ukr": "Ukrainian",
+    "hun": "Hungarian", "ces": "Czech", "gre": "Greek", "ell": "Greek", "und": "Subtitle",
+}
+
+def _sub_label(lang: str, name: str) -> str:
+    """Readable subtitle label: language name + a region hint parsed out of the
+    track NAME (e.g. 'Brazilian_CR' -> 'Portuguese (Brazilian)'), dropping the
+    fansub/source tags that make raw NAMEs ('CR', 'CR (2)') unreadable."""
+    base = _LANG_NAMES.get((lang or "und").lower(), (lang or "Subtitle").title())
+    region = re.sub(r"[\[\]()_]+", " ", name or "")          # separators -> space FIRST
+    region = re.sub(r"\b(CR|WEB-?DL|WEB-?Rip|BD|Crunchyroll|Funi(?:mation)?|Netflix|NF|"
+                    r"Amazon|AMZN|HIDIVE|Bilibili|Erai-?raws|SubsPlease|sub|dub|full)\b",
+                    "", region, flags=re.I)                  # then strip source tags
+    region = re.sub(r"\s{2,}", " ", region).strip(" -·").strip()
+    # drop a bare dedup-counter number ('CR (3)' -> '3') or a region that just
+    # restates the language ('English (English US)').
+    if region.isdigit() or (region and base.lower() in region.lower()):
+        region = ""
+    return f"{base} ({region})" if region else base
+
+
+async def _selfhost_source(http: httpx.AsyncClient, anilist_id: int, ep: int, category: str) -> Optional[dict]:
+    """If the episode is cached on our self-hosted video origin, return it as a
+    source (HLS master + subtitle VTTs). The whole HLS is proxied by watch.py just
+    like any other source, so the origin IP stays hidden from the browser."""
+    if not settings.SELFHOST_CACHE or not settings.SELFHOST_ORIGIN:
+        return None
+    # One canonical multi-audio build per episode (under "sub"); a dub is just
+    # another audio track inside it, so serve the SAME build for either toggle.
+    base = f"{settings.SELFHOST_ORIGIN}/{anilist_id}/{ep}/sub"
+    try:
+        r = await http.get(f"{base}/master.m3u8", timeout=5.0)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.status_code != 200 or "#EXTM3U" not in r.text[:64]:
+        return None
+    # audio tracks carried by the build (JP + any dubs), parsed from EXT-X-MEDIA AUDIO
+    audios: list[dict] = []
+    for line in r.text.splitlines():
+        if line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line:
+            nm = re.search(r'NAME="([^"]*)"', line)
+            lg = re.search(r'LANGUAGE="([^"]*)"', line)
+            audios.append({"name": nm.group(1) if nm else "Audio",
+                           "lang": lg.group(1) if lg else "", "default": "DEFAULT=YES" in line})
+    has_dub = any(not (a["lang"] or "").startswith("ja") for a in audios)
+    # DUB toggle: only surface self-host if the build actually carries a non-JP audio
+    # (else this episode is sub-only — fall back to other dub sources / sub).
+    if category == "dub" and not has_dub:
+        return None
+    subs: list[dict] = []
+    fonts: list[str] = []
+    seen: dict[str, int] = {}
+
+    def _add(lang, name, vtt_url, ass_url, default):
+        label = _sub_label(lang, name)
+        n = seen.get(label, 0) + 1; seen[label] = n
+        subs.append({"label": label if n == 1 else f"{label} ({n})", "language": lang,
+                     "file": vtt_url, "ass": ass_url, "default": default})
+
+    # Prefer the subs/tracks.json manifest -> styled ASS + embedded fonts (faithful
+    # JASSUB render). Fall back to the master's EXT-X-MEDIA SUBTITLES (VTT only).
+    try:
+        tr = await http.get(f"{base}/subs/tracks.json", timeout=4.0)
+        if tr.status_code == 200:
+            man = tr.json()
+            for t in man.get("subs", []):
+                _add(t.get("lang", ""), t.get("name", ""),
+                     f"{base}/{t['vtt']}" if t.get("vtt") else None,
+                     f"{base}/{t['ass']}" if t.get("ass") else None,
+                     bool(t.get("default")))
+            fonts = [f"{base}/{x}" for x in man.get("fonts", [])]
+    except Exception:  # noqa: BLE001
+        pass
+    if not subs:
+        for line in r.text.splitlines():
+            if line.startswith("#EXT-X-MEDIA:") and "TYPE=SUBTITLES" in line:
+                uri = re.search(r'URI="([^"]+)"', line)
+                if not uri:
+                    continue
+                name = re.search(r'NAME="([^"]*)"', line)
+                lang = re.search(r'LANGUAGE="([^"]*)"', line)
+                _add(lang.group(1) if lang else "", name.group(1) if name else "",
+                     f"{base}/{uri.group(1).rsplit('.', 1)[0]}.vtt", None, "DEFAULT=YES" in line)
+    # for a DUB request, hint the player to default to a non-Japanese audio
+    default_audio = None
+    if category == "dub":
+        nonjp = next((a for a in audios if not (a["lang"] or "").startswith("ja")), None)
+        default_audio = nonjp["lang"] if nonjp else None
+    return {"host": "anichan", "type": "hls", "label": "AniChan · self-hosted (ad-free)",
+            "url": f"{base}/master.m3u8", "referer": "", "subtitles": subs,
+            "fonts": fonts, "audios": audios, "default_audio": default_audio, "intro": None}
+
+
+_ingest_fired: dict[tuple, float] = {}
+_INGEST_TTL = 1800  # don't re-trigger the same (anime, ep) within 30 min
+
+
+async def trigger_ingest(http: httpx.AsyncClient, anilist_id: int, ep: int) -> None:
+    """Fire-and-forget: ask the video node to cache this episode (+ prefetch) when
+    a user opens the page. Deduped per (anime, ep) so reloads don't spam it; the
+    video node itself dedups vs cached/in-flight + caps concurrency and storage."""
+    if not settings.SELFHOST_CACHE or not settings.SELFHOST_INGEST_URL:
+        return
+    key = (anilist_id, ep)
+    now = time.time()
+    if now - _ingest_fired.get(key, 0) < _INGEST_TTL:
+        return
+    _ingest_fired[key] = now
+    if len(_ingest_fired) > 5000:
+        _ingest_fired.clear()
+    headers = {"X-Ingest-Token": settings.SELFHOST_INGEST_TOKEN} if settings.SELFHOST_INGEST_TOKEN else {}
+    try:
+        await http.get(f"{settings.SELFHOST_INGEST_URL}/ingest",
+                       params={"anilist_id": anilist_id, "ep": ep}, headers=headers, timeout=4.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_selfhost_cache: dict[tuple, tuple] = {}   # ckey -> (expiry, source_or_None)
+
+
+async def _selfhost_cached(http: httpx.AsyncClient, anilist_id: int, ep: int, category: str) -> Optional[dict]:
+    """_selfhost_source with a short, SEPARATE cache (positive 60s / negative 15s)
+    so a freshly-cached episode appears as Source 1 within seconds — never baked
+    into the 3-min Miruro list cache (which would hide it)."""
+    ck = (anilist_id, ep, category)
+    hit = _selfhost_cache.get(ck)
+    if hit and time.time() < hit[0]:
+        return hit[1]
+    src = await _selfhost_source(http, anilist_id, ep, category)
+    if len(_selfhost_cache) > 3000:
+        _selfhost_cache.clear()
+    _selfhost_cache[ck] = (time.time() + (60 if src else 15), src)
+    return src
+
+
+async def _miruro_servers(http: httpx.AsyncClient, anilist_id: int, ep: int, category: str) -> list[dict]:
+    """The Miruro-resolved curated sources (cached `_SERVERS_TTL`)."""
     ckey = (anilist_id, ep, category)
     hit = _servers_cache.get(ckey)
     if hit and time.time() - hit[0] < _SERVERS_TTL:
@@ -292,3 +433,15 @@ async def resolve_all(http: httpx.AsyncClient, anilist_id: int, ep: int, categor
         _servers_cache.clear()
     _servers_cache[ckey] = (time.time(), servers)
     return servers
+
+
+async def resolve_all(http: httpx.AsyncClient, anilist_id: int, ep: int, category: str) -> list[dict]:
+    """Curated sources for one episode — the self-hosted cache ranks #1 when
+    present, then Miruro (clean first, embeds last). The two are resolved
+    CONCURRENTLY and cached independently, so the self-host probe adds no latency
+    and a freshly-cached episode surfaces promptly (not after the Miruro TTL)."""
+    miruro, selfhost = await asyncio.gather(
+        _miruro_servers(http, anilist_id, ep, category),
+        _selfhost_cached(http, anilist_id, ep, category),
+    )
+    return [selfhost, *miruro] if selfhost else miruro

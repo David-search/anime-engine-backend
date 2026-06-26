@@ -30,16 +30,47 @@ def _out(doc: dict) -> dict:
     return doc
 
 
+def _selfhost_out(sh: dict) -> dict:
+    """selfhost_cache doc -> the shape the frontend reads (coverage + ep titles)."""
+    cached = sh.get("cached") or {}
+    sub, dub = cached.get("sub") or [], cached.get("dub") or []
+    eps = sorted(set(sub) | set(dub))
+    return {"cached_eps": eps, "cached_sub": sub, "cached_dub": dub,
+            "count": len(eps), "total_eps": sh.get("total_eps"),
+            "ep_titles": sh.get("ep_titles") or {}}
+
+
+async def _enrich_cards(result: dict) -> dict:
+    """Merge self-host coverage (count/total) onto each card in a list result, via
+    one batched selfhost_cache lookup. No-op when nothing is self-hosted yet."""
+    db = get_db()
+    cards = (result or {}).get("results") or []
+    if db is None or not cards:
+        return result
+    ids = [c.get("id") for c in cards if c.get("id")]
+    cur = db.selfhost_cache.find({"_id": {"$in": ids}}, {"cached": 1, "total_eps": 1})
+    by_id = {d["_id"]: d async for d in cur}
+    for c in cards:
+        sh = by_id.get(c.get("id"))
+        if not sh:
+            continue
+        cached = sh.get("cached") or {}
+        n = len(set(cached.get("sub") or []) | set(cached.get("dub") or []))
+        if n:
+            c["selfhost"] = {"count": n, "total_eps": sh.get("total_eps")}
+    return result
+
+
 @router.get("/catalog/trending")
 async def trending(request: Request, page: int = 1):
     if page == 1 and _trending_cache["data"] and time.time() - _trending_cache["at"] < _TRENDING_TTL:
         return _trending_cache["data"]
     try:
         items = await anilist.trending(request.app.state.http, page=page, per=24)
-        out = {"results": items, "total": len(items), "hasNext": True}
+        out = await _enrich_cards({"results": items, "total": len(items), "hasNext": True})
     except Exception:
         # AniList unreachable -> fall back to ES popularity so the page still loads.
-        return await es.filter_search(sort="POPULARITY_DESC", page=page, size=24)
+        return await _enrich_cards(await es.filter_search(sort="POPULARITY_DESC", page=page, size=24))
     if page == 1:
         _trending_cache.update(at=time.time(), data=out)
     return out
@@ -47,12 +78,12 @@ async def trending(request: Request, page: int = 1):
 
 @router.get("/catalog/popular")
 async def popular(page: int = 1):
-    return await es.filter_search(sort="POPULARITY_DESC", page=page, size=24)
+    return await _enrich_cards(await es.filter_search(sort="POPULARITY_DESC", page=page, size=24))
 
 
 @router.get("/catalog/airing")
 async def airing(page: int = 1):
-    return await es.filter_search(status="RELEASING", sort="SCORE_DESC", page=page, size=24)
+    return await _enrich_cards(await es.filter_search(status="RELEASING", sort="SCORE_DESC", page=page, size=24))
 
 
 @router.get("/catalog/genres")
@@ -73,14 +104,14 @@ async def browse(q: str = "", genre: str = "", tag: str = "", fmt: str = "",
     # available=1 (default) hides only KNOWN-unplayable titles; pass available=0 to show all.
     if q.strip() and page == 1:
         logger.info("🔎 search · %r", q.strip())
-    return await es.filter_search(
+    return await _enrich_cards(await es.filter_search(
         q=q,
         genres=[g for g in genre.split(",") if g],
         tags=[t for t in tag.split(",") if t],
         fmt=fmt or None, status=status or None, season=season or None,
         source=source or None, year=year or None, sort=sort,
         available=bool(available), page=page, size=30,
-    )
+    ))
 
 
 @router.get("/catalog/search")
@@ -89,7 +120,7 @@ async def search(q: str = "", available: int = 1, page: int = 1):
         return {"results": [], "total": 0, "hasNext": False}
     if page == 1:
         logger.info("🔎 search · %r", q.strip())
-    return await es.filter_search(q=q, sort="POPULARITY_DESC", available=bool(available), page=page, size=30)
+    return await _enrich_cards(await es.filter_search(q=q, sort="POPULARITY_DESC", available=bool(available), page=page, size=30))
 
 
 @router.get("/catalog/sitemap")
@@ -111,4 +142,9 @@ async def detail(anime_id: int):
     doc = await db.anime.find_one({"_id": anime_id}) if db is not None else None
     if not doc:
         raise HTTPException(404, "anime not found")
-    return _out(doc)
+    out = _out(doc)
+    if db is not None:
+        sh = await db.selfhost_cache.find_one({"_id": anime_id})
+        if sh:
+            out["selfhost"] = _selfhost_out(sh)
+    return out
