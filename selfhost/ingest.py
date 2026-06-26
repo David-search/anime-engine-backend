@@ -24,6 +24,9 @@ import relparser as rp   # ported Amatsu parser (season-aware episode extraction
 LIBRARY = "/data/library"
 CACHE = "/data/cache"
 HLS_BUILD = "/data/hls_build.py"
+# "Y" mode (default ON): remux/copy the 1080p H.264 source + encode only 720/480.
+# Set REMUX_1080=0 to re-encode all three (smaller files, ~31% more GPU time).
+REMUX_1080 = os.getenv("REMUX_1080", "1").lower() not in ("0", "false", "no")
 UA = "anichan-ingest/1.0"
 BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")   # backend to push cache-state to
 INGEST_TOKEN = os.getenv("INGEST_TOKEN", "")             # shared secret (== backend SELFHOST_INGEST_TOKEN)
@@ -677,8 +680,12 @@ def nvenc_available():
     global _nvenc_ok
     if _nvenc_ok is None:
         try:
+            # 256x256, NOT 128x128: Turing NVENC (GTX 1660) rejects frames below its
+            # minimum dimension ("Frame Dimension less than the minimum supported value"),
+            # so a 128px probe false-negatives and forces a CPU encode on a working GPU.
             r = subprocess.run(["ffmpeg", "-hide_banner", "-f", "lavfi",
-                                "-i", "nullsrc=s=128x128:d=0.1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                                "-i", "color=c=black:s=256x256:d=0.1", "-c:v", "h264_nvenc",
+                                "-pix_fmt", "yuv420p", "-f", "null", "-"],
                                capture_output=True, timeout=30)
             _nvenc_ok = (r.returncode == 0)
         except Exception:  # noqa: BLE001
@@ -689,7 +696,13 @@ def nvenc_available():
 
 def build_and_register(file, anilist_id, ep, category, source_title):
     out = os.path.join(CACHE, str(anilist_id), str(ep), category)
-    cmd = ["python3", HLS_BUILD, file, out, "--renditions", "1080,720,480"]
+    # "Y" mode: remux/copy the 1080p H.264 source (no re-encode) + encode only 720/480.
+    # hls_build auto-falls-back to a full encode for HEVC/10-bit sources that can't be
+    # browser-remuxed. REMUX_1080=0 re-encodes all three.
+    if REMUX_1080:
+        cmd = ["python3", HLS_BUILD, file, out, "--remux-native", "--renditions", "720,480"]
+    else:
+        cmd = ["python3", HLS_BUILD, file, out, "--renditions", "1080,720,480"]
     if not nvenc_available():
         cmd.append("--no-nvenc")        # GPU lost -> CPU encode (the ladder still builds)
     p = subprocess.run(cmd, capture_output=True, text=True)
