@@ -86,6 +86,7 @@ QUALITY = {
     480:  {"cq": 25, "crf": 22, "maxrate": "1400k"},
 }
 DEFAULT_Q = {"cq": 24, "crf": 21, "maxrate": "5000k"}
+X264_PRESET = os.getenv("HLS_X264_PRESET", "slow")   # libx264 (CPU) preset; "veryfast" for build-farm CPU workers
 
 def _double_rate(r):
     """'5000k' -> '10000k' (2x maxrate is a sane VBV bufsize)."""
@@ -118,7 +119,7 @@ def build_video_rendition(src, outdir, height, native, src_is_h264_8bit, use_nve
             mode = f"nvenc cq{cq}"
         else:
             crf = q["crf"]
-            enc = ["libx264", "-preset", "slow", "-crf", str(crf),
+            enc = ["libx264", "-preset", X264_PRESET, "-crf", str(crf),
                    "-maxrate", maxr, "-bufsize", buf, "-tune", "animation",
                    "-pix_fmt", "yuv420p", "-profile:v", "high"]
             mode = f"x264 crf{crf}"
