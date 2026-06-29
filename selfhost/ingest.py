@@ -16,7 +16,7 @@ CLI:
   ingest.py series  <anilist_id> [--eps 1-12|1,3,5] [--dry-run] [--no-hevc]
   ingest.py stats | evict <cap_gb> | reindex      (delegates to cache_db)
 """
-import sys, os, re, json, time, subprocess, argparse, urllib.request, urllib.parse, urllib.error, datetime
+import sys, os, re, json, time, math, subprocess, argparse, urllib.request, urllib.parse, urllib.error, datetime, threading
 import xml.etree.ElementTree as ET, email.utils
 import cache_db
 import relparser as rp   # ported Amatsu parser (season-aware episode extraction)
@@ -520,12 +520,53 @@ def _live(rel):
         return 1            # unknown (some AnimeTosho rows omit it) -> don't penalize
     return 1 if int(s or 0) >= MIN_SEED else 0
 
+def richness(rel, allow_hevc=True):
+    """Product value of a release — quality + dub + subtitle breadth — WITHOUT
+    seeders. Seeders are ranked separately (see select_release) so they break ties
+    among equally-rich releases but NEVER outrank a dub/multisub release that is
+    merely fewer-seeded. Dub + many subs are first-class and not traded for speed."""
+    t = rel["title"]
+    sc = {1080: 1000, 720: 600, 480: 300}.get(res_of(t), 0)
+    if is_dualaudio(t):
+        sc += 400                      # dub (sub+dub in one download) — VERY important
+    if is_multisub(t):
+        sc += 200                      # every subtitle language — VERY important
+    if not is_hevc(t):
+        sc += 150                      # H.264 -> instant remux master
+    return sc
+
+# Seeder weight: seeders enter the rank as SEED_W * log10(seeders+1), so it takes a
+# MULTIPLICATIVE seed advantage — not a flat +N — to overcome a richer release. At the
+# default 600, a ~10x seed advantage (log10 ≈ 1) is exactly enough to outrank a full
+# dual-audio + multisub release (+600); a dual-only (+400) yields at ~4.6x, multisub-
+# only (+200) at ~2.2x. So a dub is dropped ONLY when the leaner release has many times
+# more seeders (the farm-speed win is large), never for a marginal seed gain. Raise
+# SEED_W to chase seeders harder (drop dubs at a smaller multiple); lower it to protect
+# dub/sub coverage further. A dead torrent (0 seeders) contributes 0 and sinks on its own.
+SEED_W = float(os.getenv("SEED_W", "600"))
+def _seed_bonus(rel):
+    s = rel.get("seeders")
+    if s is None:
+        s = 30             # unknown (some AnimeTosho rows omit it) -> assume modestly healthy
+    return SEED_W * math.log10(max(int(s or 0), 0) + 1)
+
+def rank_value(rel, allow_hevc=True):
+    """Total ranking value = richness (dub/sub/quality) + log-scaled seeder bonus.
+    A leaner release overtakes a richer one only when its seed advantage is large
+    enough that SEED_W*log10(ratio) exceeds the richness gap (~10x for dual+multisub)."""
+    return richness(rel, allow_hevc) + _seed_bonus(rel)
+
 def select_release(releases, ep, ctx, allow_hevc=True):
     """Pick the best release for episode `ep`. Prefer a single-file release that
-    AUTHORITATIVELY maps to `ep`, ranked by (confidence, alive, quality) — so a
-    dead torrent never beats a seeded one of equal confidence, but correctness
-    always outranks seeds. Falls back to a batch pack covering `ep` (per-file).
-    Returns (release, conf); conf == 'batch' means extract one file from the pack."""
+    AUTHORITATIVELY maps to `ep`, ranked by (correctness, rank_value, eid).
+    Correctness (strong eid/sxxeyy/absolute/airdate) is the top gate — a wrong-episode
+    guess never wins on seeders. Within that, rank_value blends richness (dub +
+    multisub + 1080 + H.264) with a log-scaled seeder bonus, so a dub/multisub release
+    is displaced ONLY when a leaner one has many times more seeders (≈10x for full
+    dual+multisub; see SEED_W) — a big farm-speed win — and the most-seeded of two
+    equally-rich releases always wins (free speedup). Falls back to a batch pack
+    covering `ep` (per-file). Returns (release, conf); conf == 'batch' means extract
+    one file from the pack."""
     singles, batches = [], []
     for r in releases:
         t = r.get("title", "")
@@ -535,24 +576,35 @@ def select_release(releases, ep, ctx, allow_hevc=True):
             continue
         epn, conf = map_episode(r, ctx)
         if epn == ep:
-            # Correctness first as a STRONG-vs-weak gate (all of eid/sxxeyy/absolute/
-            # airdate are episode-correct via the collision guards), THEN seeded, THEN
-            # quality+dual-audio score, with eid as the final tiebreaker. This lets a
-            # strong dual-audio release outrank an eid sub-only one (we want the dub),
-            # without ever promoting a weak `parsed` guess.
-            singles.append((1 if conf in STRONG else 0, _live(r), score(r, allow_hevc),
-                            1 if conf == "eid" else 0, r, conf))
+            mb = _rel_mb(r)                                   # per-episode BLOAT ceiling: we re-encode/remux
+            ceil = 14000 if (ctx.get("episodes") or 0) <= 2 else 6000   # movie vs TV (MB)
+            if mb and mb > ceil:
+                continue                                     # skip bloat single (huge download, discarded fidelity)
+            singles.append((1 if conf in STRONG else 0,      # correctness gate (never compromised)
+                            rank_value(r, allow_hevc),        # richness + log-scaled seeders (10x-gated)
+                            1 if conf == "eid" else 0,        # eid as the final tiebreaker
+                            r, conf))
             continue
         br = map_batch(r, ctx)
         if br and br[0] <= ep <= br[1]:
-            batches.append((_live(r), score(r, allow_hevc), r))
+            batches.append((rank_value(r, allow_hevc), r))
     if singles:
-        singles.sort(key=lambda c: (c[0], c[1], c[2], c[3]), reverse=True)
-        return singles[0][4], singles[0][5]
+        singles.sort(key=lambda c: c[:3], reverse=True)
+        return singles[0][3], singles[0][4]
     if batches:
-        batches.sort(key=lambda c: (c[0], c[1]), reverse=True)
-        return batches[0][2], "batch"
+        batches.sort(key=lambda c: c[:1], reverse=True)
+        return batches[0][1], "batch"
     return None, None
+
+def _rel_mb(rel):
+    """Release size in MB (numeric). AnimeTosho gives bytes (int); Nyaa gives '1.3 GiB' (str)."""
+    s = rel.get("total_size")
+    if isinstance(s, (int, float)):
+        return s / 1048576
+    m = re.match(r"([\d.]+)\s*([KMGT])i?B", str(s or ""))
+    if m:
+        return float(m.group(1)) * {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1048576}[m.group(2)]
+    return 0.0
 
 def _size_mb(rel):
     s = rel.get("total_size")
@@ -582,43 +634,78 @@ def torrent_ids():
             ids.add(int(m.group(1)))
     return ids
 
+_tr_add_lock = threading.Lock()
+
+def _add_and_get_tid(torrent_url):
+    """Add a torrent and reliably return ITS id. MUST be serialised: with concurrent download
+    threads, diffing the global torrent list races — two adds in flight both appear in `new`,
+    max() picks the wrong one, and the old `max(torrent_ids())` fallback grabbed an UNRELATED
+    torrent (e.g. a big batch pack) -> every racing download returned that pack's file. The lock
+    makes add+detect atomic so each caller gets exactly its own torrent."""
+    with _tr_add_lock:
+        before = torrent_ids()
+        tr("-a", torrent_url, "--download-dir", LIBRARY)
+        t0 = time.time()
+        while time.time() - t0 < 15:
+            new = torrent_ids() - before
+            if new:
+                return max(new)
+            time.sleep(1)
+    raise RuntimeError("could not add torrent (no new id appeared)")
+
+DEAD_AFTER = int(os.getenv("TORRENT_DEAD_AFTER", "150"))   # give up on a 0-byte torrent this fast
+
 def download(torrent_url, timeout_s=1800, poll=10):
-    before = torrent_ids()
-    tr("-a", torrent_url, "--download-dir", LIBRARY)
-    time.sleep(3)
-    new = torrent_ids() - before
-    tid = max(new) if new else (max(torrent_ids()) if torrent_ids() else None)
-    if tid is None:
-        raise RuntimeError("could not add torrent")
-    tr("-t", str(tid), "-s")  # ensure started
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
+    """Add a torrent, wait for completion, return (tid, path). On ANY failure (dead/timeout/
+    missing file) the torrent + its partial data are REMOVED before raising — a leaked torrent
+    sits in transmission forever, holding an active-download slot and starving alive torrents
+    queued behind it. Also gives up early on a torrent that downloads NOTHING in DEAD_AFTER s
+    (no peers) instead of blocking a slot for the full timeout."""
+    tid = _add_and_get_tid(torrent_url)
+    try:
+        tr("-t", str(tid), "-s")  # ensure started
+        t0 = time.time(); stall = time.time(); last = 0.0
+        while time.time() - t0 < timeout_s:
+            info = tr("-t", str(tid), "-i")
+            dm = re.search(r"Percent Done:\s*([\d.]+)%", info)
+            st = re.search(r"State:\s*(.+)", info)
+            pct = float(dm.group(1)) if dm else 0.0
+            if pct >= 100 or (st and ("Finished" in st.group(1) or "Seeding" in st.group(1))):
+                break
+            if pct > last:
+                last = pct; stall = time.time()
+            elif pct == 0.0 and time.time() - stall > DEAD_AFTER:
+                raise RuntimeError(f"dead torrent (no data in {DEAD_AFTER}s)")
+            time.sleep(poll)
+        else:
+            raise RuntimeError(f"torrent timeout after {timeout_s}s")
         info = tr("-t", str(tid), "-i")
-        dm = re.search(r"Percent Done:\s*([\d.]+)%", info)
-        st = re.search(r"State:\s*(.+)", info)
-        pct = float(dm.group(1)) if dm else 0.0
-        if pct >= 100 or (st and ("Finished" in st.group(1) or "Seeding" in st.group(1))):
-            break
-        time.sleep(poll)
-    info = tr("-t", str(tid), "-i")
-    name = re.search(r"Name:\s*(.+)", info)
-    loc = re.search(r"Location:\s*(.+)", info)
-    if not (name and loc):
-        raise RuntimeError("torrent info missing name/location")
-    path = os.path.join(loc.group(1).strip(), name.group(1).strip())
-    if os.path.isdir(path):  # multi-file torrent -> biggest .mkv inside
-        mkvs = [os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(".mkv")]
-        path = max(mkvs, key=os.path.getsize) if mkvs else path
-    if not os.path.exists(path):
-        raise RuntimeError(f"downloaded file not found at {path}")
-    return tid, path
+        name = re.search(r"Name:\s*(.+)", info)
+        loc = re.search(r"Location:\s*(.+)", info)
+        if not (name and loc):
+            raise RuntimeError("torrent info missing name/location")
+        path = os.path.join(loc.group(1).strip(), name.group(1).strip())
+        if os.path.isdir(path):  # multi-file torrent -> biggest .mkv inside
+            mkvs = [os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(".mkv")]
+            path = max(mkvs, key=os.path.getsize) if mkvs else path
+        if not os.path.exists(path):
+            raise RuntimeError(f"downloaded file not found at {path}")
+        return tid, path
+    except Exception:
+        try: tr("-t", str(tid), "--remove-and-delete")   # don't leak the slot
+        except Exception: pass
+        raise
 
 def _parse_size(s):
-    m = re.match(r"([\d.]+)\s*([KMGT])?i?B", str(s).strip())
+    # UNIT-AWARE: transmission-remote prints DECIMAL sizes ("547.0 MB" = 547e6, "1.3 GB" = 1.3e9);
+    # an 'i' (GiB/MiB) means binary. Treating decimal "MB"/"GB" as binary inflated expected size
+    # ~5-7%, so COMPLETE files read 93-95% and the batch wait-loop's 0.98 check NEVER yielded.
+    m = re.match(r"([\d.]+)\s*([KMGT])?(i)?B", str(s).strip())
     if not m:
         return 0
-    mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, None: 1}[m.group(2)]
-    return int(float(m.group(1)) * mult)
+    base = 1024 if m.group(3) else 1000           # 'i' present -> binary, else decimal (SI)
+    exp = {"K": 1, "M": 2, "G": 3, "T": 4, None: 0}[m.group(2)]
+    return int(float(m.group(1)) * base ** exp)
 
 def _tr_files(tid):
     """Parse `transmission-remote -t <id> -f` into [{index,name,size}]."""
@@ -633,13 +720,7 @@ def _tr_files(tid):
 def download_batch_file(torrent_url, ep, season, timeout_s=3600, poll=10):
     """Add a batch pack, identify episode `ep`'s file (Amatsu select_best_video_file),
     and download ONLY that file (deselect the rest) — no full-pack download."""
-    before = torrent_ids()
-    tr("-a", torrent_url, "--download-dir", LIBRARY)
-    time.sleep(3)
-    new = torrent_ids() - before
-    tid = max(new) if new else (max(torrent_ids()) if torrent_ids() else None)
-    if tid is None:
-        raise RuntimeError("could not add batch torrent")
+    tid = _add_and_get_tid(torrent_url)
     files, t0 = [], time.time()
     while time.time() - t0 < 180:            # .torrent metadata is immediate; get file list
         files = _tr_files(tid)
@@ -670,6 +751,51 @@ def download_batch_file(torrent_url, ep, season, timeout_s=3600, poll=10):
     if not os.path.exists(path):
         raise RuntimeError(f"extracted file not found: {path}")
     return tid, path
+
+def download_batch_multi(torrent_url, eps_seasons, staging="/data/staging", timeout_s=10800, poll=8):
+    """Add a batch pack ONCE, select the files for the requested [(ep,season),...], download
+    ONLY those, and YIELD (ep, staged_path) as each completes (copied out to `staging` so the
+    encoder reads a stable file). Removes the torrent + data at the end. Used by the farm for
+    batch-only back-catalog titles (no per-episode single release exists)."""
+    import shutil
+    os.makedirs(staging, exist_ok=True)
+    tid = _add_and_get_tid(torrent_url)
+    files, t0 = [], time.time()
+    while time.time() - t0 < 180:
+        files = _tr_files(tid)
+        if files: break
+        time.sleep(2)
+    if not files:
+        tr("-t", str(tid), "--remove-and-delete"); raise RuntimeError("batch file list unavailable")
+    picks = {}                                            # ep -> file dict
+    for ep, season in eps_seasons:
+        f = rp.select_best_video_file(files, ep, season)
+        if f: picks[ep] = f
+    if not picks:
+        tr("-t", str(tid), "--remove-and-delete"); return
+    wanted = {f["index"] for f in picks.values()}
+    others = [str(f["index"]) for f in files if f["index"] not in wanted]
+    if others: tr("-t", str(tid), "-G", ",".join(others))
+    tr("-t", str(tid), "-g", ",".join(str(i) for i in wanted))
+    tr("-t", str(tid), "-sr", "999"); tr("-t", str(tid), "-s")   # per-torrent ratio so ratio-0 won't stop it
+    info = tr("-t", str(tid), "-i")
+    locm = re.search(r"Location:\s*(.+)", info)
+    LOC = locm.group(1).strip() if locm else LIBRARY   # download-dir; transmission's f["name"] is
+    # the path RELATIVE to it (already includes the torrent's top folder), so join LOC + name — NOT
+    # loc/torrentname + name, which duplicated the folder and made every file path nonexistent.
+    yielded, t0 = set(), time.time()
+    while time.time() - t0 < timeout_s and len(yielded) < len(picks):
+        for ep, f in picks.items():
+            if ep in yielded: continue
+            fp = os.path.join(LOC, f["name"])
+            if os.path.exists(fp) and f["size"] and os.path.getsize(fp) >= 0.98 * f["size"]:
+                # tid+file-index is globally unique -> no same-millisecond staging-name collision
+                dst = os.path.join(staging, f"t{tid}_{f['index']}_{os.path.basename(f['name'])}")
+                try: shutil.copy(fp, dst)
+                except OSError: continue
+                yielded.add(ep); yield ep, dst
+        time.sleep(poll)
+    tr("-t", str(tid), "--remove-and-delete")
 
 # ---------- build + register ----------
 _nvenc_ok = None

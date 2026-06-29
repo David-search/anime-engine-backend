@@ -14,7 +14,7 @@ Scope: currently-airing (RELEASING) + top-popularity, deduped, skipping >100 eps
 Usage: pre_resolve.py [--out /data/todo.jsonl] [--airing 60] [--top 500]
                       [--pace 2.0] [--limit N]
 """
-import sys, os, json, time, argparse
+import sys, os, json, time, argparse, threading
 sys.path.insert(0, "/data")
 import ingest
 
@@ -55,6 +55,17 @@ def resolve_anime(aid):
                         "url": sel["torrent_url"], "conf": conf})
     return out
 
+def resolve_anime_timed(aid, timeout):
+    """resolve_anime with a hard per-anime wall-clock cap (some titles page AnimeTosho
+    slowly / stall); returns "TIMEOUT" if exceeded so the caller can skip it."""
+    res = [None]; done = threading.Event()
+    def _run():
+        try: res[0] = resolve_anime(aid)
+        except Exception: res[0] = None
+        finally: done.set()
+    threading.Thread(target=_run, daemon=True).start()
+    return res[0] if done.wait(timeout) else "TIMEOUT"
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/data/todo.jsonl")
@@ -62,6 +73,7 @@ def main():
     ap.add_argument("--top", type=int, default=500)
     ap.add_argument("--pace", type=float, default=2.0)   # seconds between anime (avoid 429)
     ap.add_argument("--limit", type=int, default=0)      # cap anime count (0 = all)
+    ap.add_argument("--timeout", type=float, default=120)  # per-anime resolve cap (s)
     a = ap.parse_args()
 
     scope = anime_scope(a.airing, a.top)
@@ -74,9 +86,12 @@ def main():
             aid = m["id"]
             title = (m["title"].get("english") or m["title"].get("romaji") or str(aid))
             try:
-                eps = resolve_anime(aid)
+                eps = resolve_anime_timed(aid, a.timeout)
             except Exception as e:  # noqa: BLE001
                 print(f"  [skip] {aid} {title[:40]}: {e}", flush=True); time.sleep(a.pace); continue
+            if eps == "TIMEOUT":
+                print(f"  [timeout] {aid} {title[:40]} (>{a.timeout:.0f}s, skipped)", flush=True); time.sleep(a.pace); continue
+            eps = eps or []
             for e in eps:
                 f.write(json.dumps(e) + "\n")
             f.flush()

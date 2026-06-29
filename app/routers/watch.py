@@ -118,8 +118,9 @@ async def servers(request: Request, anilistId: int, ep: int = 1, category: str =
     """Curated source list for one episode (reliable hosts, clean first then
     embeds). hls/mp4 play via our proxy; embed is a sandboxed iframe URL."""
     logger.info("▶ watch · %s · ep %s · %s", await _title(anilistId), ep, category)
-    # opening/playing an episode → tell the video node to cache it (+ prefetch).
-    _bg(sources.trigger_ingest(request.app.state.http, anilistId, ep))
+    # DISABLED (2026-06-26): no more auto-triggered downloads. Self-host builds are
+    # now a manual / build-farm step, not kicked off by a viewer opening a page.
+    # _bg(sources.trigger_ingest(request.app.state.http, anilistId, ep))
     items = await sources.resolve_all(request.app.state.http, anilistId, ep, category)
     out = []
     for i, s in enumerate(items, 1):
@@ -168,14 +169,23 @@ async def cache_state(request: Request, x_ingest_token: str = Header(default="")
     db = get_db()
     if db is None:
         raise HTTPException(503, "no db")
+    cached = body.get("cached") or {}
+    # MERGE with existing coverage so a resumed/partial run never regresses prior episodes,
+    # and fill total_eps from the catalog so callers can compute which episodes are still MISSING
+    # (uncached_sub = {1..total_eps} - cached.sub) — the basis for future repopulation passes.
+    prev = await db.selfhost_cache.find_one({"_id": aid}) or {}
+    pc = prev.get("cached") or {}
+    merged = {cat: sorted(set(pc.get(cat) or []) | set(cached.get(cat) or [])) for cat in ("sub", "dub")}
+    anime = await db.anime.find_one({"_id": aid}, {"episodes": 1})
+    total = (anime or {}).get("episodes") or body.get("total_eps") or prev.get("total_eps")
+    ep_titles = {**(prev.get("ep_titles") or {}), **(body.get("ep_titles") or {})}
     await db.selfhost_cache.update_one(
         {"_id": aid},
-        {"$set": {"cached": body.get("cached") or {}, "ep_titles": body.get("ep_titles") or {},
-                  "total_eps": body.get("total_eps"), "updated_at": int(time.time())}},
+        {"$set": {"cached": merged, "ep_titles": ep_titles, "total_eps": total,
+                  "updated_at": int(time.time())}},
         upsert=True)
-    logger.info("◆ cache-state · %s · sub=%s dub=%s", aid,
-                (body.get("cached") or {}).get("sub"), (body.get("cached") or {}).get("dub"))
-    return {"ok": True, "anilist_id": aid}
+    return {"ok": True, "anilist_id": aid, "sub": len(merged["sub"]),
+            "dub": len(merged["dub"]), "total_eps": total}
 
 
 @router.get("/sources")

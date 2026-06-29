@@ -109,7 +109,12 @@ def build_video_rendition(src, outdir, height, native, src_is_h264_8bit, use_nve
         mode = "remux"
     else:
         maxr = q["maxrate"]; buf = maxr   # NVENC VBV: bufsize==maxrate (2x gave no tighter cap)
-        vf = "scale=-2:trunc(ih/2)*2" if native else f"scale=-2:{height}"
+        # Normalise to 8-bit 4:2:0 IN THE FILTER GRAPH, before the encoder. Anime sources are
+        # very often 10-bit (Hi10P, yuv420p10le) or occasionally 4:4:4 (yuv444p10le); h264_nvenc
+        # is an 8-bit encoder and REJECTS those at runtime (exit 1) unless the frames are
+        # converted up front. Output -pix_fmt alone doesn't force the pre-encoder conversion.
+        scale = "scale=-2:trunc(ih/2)*2" if native else f"scale=-2:{height}"
+        vf = scale + ",format=yuv420p"
         if use_nvenc:
             cq = q["cq"]
             enc = ["h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(cq),
@@ -265,15 +270,25 @@ def main():
         w = int(round(h * 16 / 9 / 2) * 2)
         video_rends_meta.append({"bandwidth": bandwidth, "resolution": f"{w}x{h}", "uri": f"{name}/index.m3u8"})
 
+    # Keep only Japanese (original) + English (dub) audio. Other-language dubs aren't served, and
+    # each extra track is a full sequential AAC re-encode — the dominant encode cost on multi-dub
+    # BD releases (an 11-audio rip spent ~7 min mostly here). map uses the ORIGINAL audio index;
+    # output dir uses the new compact index. Fallback: if nothing matches, keep the first track.
+    def _alang(s): return ((s.get("tags") or {}).get("language") or "").lower()
+    KEEP_AUD = {"ja", "jpn", "jp", "en", "eng", "und"}
+    keep_idx = [i for i, s in enumerate(astreams) if _alang(s) in KEEP_AUD or _alang(s)[:2] in ("ja", "en")]
+    if not keep_idx:
+        keep_idx = list(range(min(1, len(astreams))))
     audio_rends_meta = []
-    for i, a in enumerate(astreams):
-        m = build_audio_rendition(args.src, os.path.join(args.out, f"a{i}"), i)
+    for new_i, i in enumerate(keep_idx):
+        a = astreams[i]
+        m = build_audio_rendition(args.src, os.path.join(args.out, f"a{new_i}"), i)
         tags = a.get("tags", {}) or {}
         lang = tags.get("language", f"a{i}")
         nm = lang_name(lang, tags.get("title"))
         m.update({"name": nm, "lang": lang})
         report["audio"].append(m)
-        audio_rends_meta.append({"name": nm, "lang": lang, "uri": f"a{i}/index.m3u8"})
+        audio_rends_meta.append({"name": nm, "lang": lang, "uri": f"a{new_i}/index.m3u8"})
 
     sub_rends_meta = []
     sub_tracks = []   # for subs/tracks.json (ASS + VTT per language, for JASSUB)
