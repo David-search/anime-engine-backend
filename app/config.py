@@ -27,6 +27,13 @@ class Settings:
     # is offered as Source 1 (ad-free), proxied like any other HLS source.
     SELFHOST_CACHE = os.getenv("SELFHOST_CACHE", "0") == "1"
     SELFHOST_ORIGIN = os.getenv("SELFHOST_ORIGIN", "").rstrip("/")
+    # Optional CDN (e.g. a Bunny pull-zone at cdn.anichan.net) in front of the
+    # origin. When set, /api/watch emits DIRECT cdn URLs for the heavy self-host
+    # bytes (segments/audio/subtitles/fonts) instead of proxying them through this
+    # box — origin/bandwidth offload. The master playlist still proxies (so its
+    # in-manifest subtitle groups get stripped). Blank = proxy everything (current
+    # behavior). Swapping/retiring the CDN is one DNS flip; the backend stays put.
+    SELFHOST_CDN_BASE = os.getenv("SELFHOST_CDN_BASE", "").rstrip("/")
     # Video-node ingest trigger: when a user opens an anime page, fire-and-forget
     # a request here to cache the episode (+ prefetch). Empty = disabled.
     SELFHOST_INGEST_URL = os.getenv("SELFHOST_INGEST_URL", "").rstrip("/")

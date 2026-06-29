@@ -24,6 +24,9 @@ services:
       # Self-hosted video origin (offer the ad-free cache as Source 1 when present):
       - SELFHOST_CACHE=${SELFHOST_CACHE:-0}
       - SELFHOST_ORIGIN=${SELFHOST_ORIGIN:-}
+      # Optional CDN (Bunny pull-zone) in front of the origin — direct-serve the
+      # heavy bytes off the proxy. Blank = proxy everything (origin IP hidden).
+      - SELFHOST_CDN_BASE=${SELFHOST_CDN_BASE:-}
       - SELFHOST_INGEST_URL=${SELFHOST_INGEST_URL:-}
       - SELFHOST_INGEST_TOKEN=${SELFHOST_INGEST_TOKEN:-}
     restart: unless-stopped

@@ -55,6 +55,20 @@ def _proxy(kind: str, url: str, ref: str) -> str:
     return f"/api/watch/{kind}?" + urllib.parse.urlencode({"url": url, "ref": ref})
 
 
+def _emit(kind: str, url: str, ref: str) -> str:
+    """For a self-hosted-origin URL, emit a DIRECT CDN URL (offloads the bytes off
+    this proxy onto the edge) when SELFHOST_CDN_BASE is set; else fall back to
+    _proxy(). Only the heavy nested audio/video/segment/subtitle/font URLs go
+    direct — the master playlist itself still goes through _proxy() so its
+    in-manifest subtitle groups get stripped. Non-self-host (Miruro) URLs always
+    fall back to the proxy. Swapping/retiring the CDN is a DNS flip, no redeploy."""
+    cdn = settings.SELFHOST_CDN_BASE
+    origin = settings.SELFHOST_ORIGIN
+    if cdn and origin and url.startswith(origin):
+        return cdn + url[len(origin):]
+    return _proxy(kind, url, ref)
+
+
 _safe_cache: dict[str, float] = {}   # host -> expiry of a passed check
 _SAFE_TTL = 300
 
@@ -137,13 +151,13 @@ async def servers(request: Request, anilistId: int, ep: int = 1, category: str =
                 so = {"lang": x.get("label") or x.get("language") or "Subtitle",
                       "default": bool(x.get("default"))}
                 if x.get("file"):
-                    so["url"] = _proxy("vtt", x["file"], ref)        # WebVTT (fallback)
+                    so["url"] = _emit("vtt", x["file"], ref)         # WebVTT (fallback)
                 if x.get("ass"):
-                    so["ass"] = _proxy("seg", x["ass"], ref)         # styled ASS (JASSUB)
+                    so["ass"] = _emit("seg", x["ass"], ref)          # styled ASS (JASSUB)
                 subs_out.append(so)
             entry["subtitles"] = subs_out
             if s.get("fonts"):  # embedded fonts for faithful ASS rendering
-                entry["fonts"] = [_proxy("seg", f, ref) for f in s["fonts"]]
+                entry["fonts"] = [_emit("seg", f, ref) for f in s["fonts"]]
             if s.get("audios"):  # multi-audio (JP + dubs); player builds an audio selector
                 entry["audios"] = s["audios"]
             if s.get("default_audio"):  # DUB toggle -> default to a non-JP track
@@ -248,11 +262,11 @@ async def m3u8(request: Request, url: str, ref: str = ""):
                 # is proxied as m3u8; KEY/MAP byte URIs as seg.
                 uri = m.group(1)
                 kind = "m3u8" if (".m3u8" in uri.lower() or s.startswith("#EXT-X-MEDIA")) else "seg"
-                s = s.replace(uri, _proxy(kind, _abs(base, uri), ref))
+                s = s.replace(uri, _emit(kind, _abs(base, uri), ref))
             out.append(s)
             continue
         kind = "m3u8" if ".m3u8" in s.lower() else "seg"
-        out.append(_proxy(kind, _abs(base, s), ref))
+        out.append(_emit(kind, _abs(base, s), ref))
 
     return Response("\n".join(out), media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
