@@ -355,6 +355,10 @@ async def trigger_ingest(http: httpx.AsyncClient, anilist_id: int, ep: int) -> N
     """Fire-and-forget: ask the video node to cache this episode (+ prefetch) when
     a user opens the page. Deduped per (anime, ep) so reloads don't spam it; the
     video node itself dedups vs cached/in-flight + caps concurrency and storage."""
+    # DISABLED (2026-06-26): downloads are no longer auto-triggered from the request
+    # path — builds are a manual / build-farm step. The call site in watch.py is also
+    # commented out; this early return is belt-and-suspenders. Remove it to re-enable.
+    return
     if not settings.SELFHOST_CACHE or not settings.SELFHOST_INGEST_URL:
         return
     key = (anilist_id, ep)

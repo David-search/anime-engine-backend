@@ -1,0 +1,16 @@
+# First self-host test batch — 10 anime spanning eras + airing (one title per line).
+# 80s
+Akira
+Nausicaä of the Valley of the Wind
+# 90s
+Neon Genesis Evangelion
+Cowboy Bebop
+# 00s
+Death Note
+Code Geass Lelouch of the Rebellion
+# 2010s
+Steins;Gate
+Attack on Titan
+# recent / airing
+Dandadan
+Solo Leveling
