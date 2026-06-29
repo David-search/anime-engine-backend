@@ -10,6 +10,8 @@ host CDN requires (browsers can't set Referer, and the CDNs send no CORS).
     GET /api/watch/vtt?url=&ref=               -> subtitle track (text/vtt)
 """
 import asyncio
+import base64
+import hashlib
 import ipaddress
 import logging
 import re
@@ -55,17 +57,36 @@ def _proxy(kind: str, url: str, ref: str) -> str:
     return f"/api/watch/{kind}?" + urllib.parse.urlencode({"url": url, "ref": ref})
 
 
+def _sign(cdn_url: str) -> str:
+    """Bunny Token Authentication: append ?token=<sha256_b64url(key+path+exp)>&expires=<exp>
+    so the URL can't be enumerated/hotlinked. No-op when SELFHOST_CDN_TOKEN_KEY is
+    unset (i.e. Bunny token auth is off). Path-scoped + short-lived; no IP binding
+    (would break mobile/dual-stack viewers)."""
+    key = settings.SELFHOST_CDN_TOKEN_KEY
+    if not key:
+        return cdn_url
+    path = urllib.parse.urlsplit(cdn_url).path
+    exp = int(time.time()) + settings.SELFHOST_CDN_TTL
+    digest = hashlib.sha256(f"{key}{path}{exp}".encode()).digest()
+    tok = base64.b64encode(digest).decode().replace("+", "-").replace("/", "_").replace("=", "")
+    return f"{cdn_url}?token={tok}&expires={exp}"
+
+
 def _emit(kind: str, url: str, ref: str) -> str:
-    """For a self-hosted-origin URL, emit a DIRECT CDN URL (offloads the bytes off
-    this proxy onto the edge) when SELFHOST_CDN_BASE is set; else fall back to
-    _proxy(). Only the heavy nested audio/video/segment/subtitle/font URLs go
-    direct — the master playlist itself still goes through _proxy() so its
-    in-manifest subtitle groups get stripped. Non-self-host (Miruro) URLs always
-    fall back to the proxy. Swapping/retiring the CDN is a DNS flip, no redeploy."""
+    """For a self-hosted-origin URL: PLAYLISTS (.m3u8) keep going through _proxy()
+    so this box can rewrite + token-sign their child URLs (and strip the master's
+    in-manifest subtitle groups); leaf files (segments / subtitles / fonts) are
+    emitted as DIRECT, token-signed CDN URLs so the heavy bytes offload onto the
+    edge. HLS segment URLs are relative, so they MUST be rewritten to absolute
+    signed URLs here — a bare signed master wouldn't authorize its segments. When
+    SELFHOST_CDN_BASE is unset, or for non-self-host (Miruro) URLs, everything
+    falls back to _proxy(). Retiring the CDN is a DNS flip, no redeploy."""
     cdn = settings.SELFHOST_CDN_BASE
     origin = settings.SELFHOST_ORIGIN
     if cdn and origin and url.startswith(origin):
-        return cdn + url[len(origin):]
+        if kind == "m3u8":
+            return _proxy(kind, url, ref)            # playlist → proxy so its children get tokenized
+        return _sign(cdn + url[len(origin):])        # leaf file → direct CDN + token
     return _proxy(kind, url, ref)
 
 

@@ -34,6 +34,12 @@ class Settings:
     # in-manifest subtitle groups get stripped). Blank = proxy everything (current
     # behavior). Swapping/retiring the CDN is one DNS flip; the backend stays put.
     SELFHOST_CDN_BASE = os.getenv("SELFHOST_CDN_BASE", "").rstrip("/")
+    # Bunny Token Authentication: sign each direct-CDN URL (sha256 of key+path+exp)
+    # so the library can't be enumerated/hotlinked. Empty = emit unsigned CDN URLs
+    # (only works if Bunny token auth is OFF). TTL is generous (covers a viewing
+    # session incl. long pauses) while still expiring leaked/hotlinked URLs.
+    SELFHOST_CDN_TOKEN_KEY = os.getenv("SELFHOST_CDN_TOKEN_KEY", "")
+    SELFHOST_CDN_TTL = int(os.getenv("SELFHOST_CDN_TTL", "43200"))  # seconds (12h)
     # Video-node ingest trigger: when a user opens an anime page, fire-and-forget
     # a request here to cache the episode (+ prefetch). Empty = disabled.
     SELFHOST_INGEST_URL = os.getenv("SELFHOST_INGEST_URL", "").rstrip("/")
